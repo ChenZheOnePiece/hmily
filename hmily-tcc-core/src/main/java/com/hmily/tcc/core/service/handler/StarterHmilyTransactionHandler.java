@@ -19,47 +19,81 @@ package com.hmily.tcc.core.service.handler;
 
 import com.hmily.tcc.common.bean.context.TccTransactionContext;
 import com.hmily.tcc.common.bean.entity.TccTransaction;
+import com.hmily.tcc.common.config.TccConfig;
 import com.hmily.tcc.common.enums.TccActionEnum;
+import com.hmily.tcc.core.concurrent.threadlocal.TransactionContextLocal;
+import com.hmily.tcc.core.concurrent.threadpool.HmilyThreadFactory;
 import com.hmily.tcc.core.service.HmilyTransactionHandler;
 import com.hmily.tcc.core.service.executor.HmilyTransactionExecutor;
 import org.aspectj.lang.ProceedingJoinPoint;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.ApplicationListener;
+import org.springframework.context.event.ContextRefreshedEvent;
 import org.springframework.stereotype.Component;
 
+import java.util.concurrent.Executor;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+
 /**
- * this is transaction starter.
+ * this is hmily transaction starter.
+ *
  * @author xiaoyu
  */
 @Component
-public class StarterHmilyTransactionHandler implements HmilyTransactionHandler {
+public class StarterHmilyTransactionHandler implements HmilyTransactionHandler, ApplicationListener<ContextRefreshedEvent> {
 
     private final HmilyTransactionExecutor hmilyTransactionExecutor;
 
+    private Executor executor;
+
+    private final TccConfig tccConfig;
+
     @Autowired
-    public StarterHmilyTransactionHandler(final HmilyTransactionExecutor hmilyTransactionExecutor) {
+    public StarterHmilyTransactionHandler(final HmilyTransactionExecutor hmilyTransactionExecutor, TccConfig tccConfig) {
         this.hmilyTransactionExecutor = hmilyTransactionExecutor;
+        this.tccConfig = tccConfig;
     }
 
+
     @Override
-    public Object handler(final ProceedingJoinPoint point, final TccTransactionContext context) throws Throwable {
+    public Object handler(final ProceedingJoinPoint point, final TccTransactionContext context)
+            throws Throwable {
         Object returnValue;
         try {
-            final TccTransaction tccTransaction = hmilyTransactionExecutor.begin(point);
+            TccTransaction tccTransaction = hmilyTransactionExecutor.begin(point);
             try {
-                //发起调用 执行try方法
+                //execute try
                 returnValue = point.proceed();
                 tccTransaction.setStatus(TccActionEnum.TRYING.getCode());
                 hmilyTransactionExecutor.updateStatus(tccTransaction);
             } catch (Throwable throwable) {
-                //异常执行cancel
-                hmilyTransactionExecutor.cancel(hmilyTransactionExecutor.getCurrentTransaction());
+                //if exception ,execute cancel
+                final TccTransaction currentTransaction = hmilyTransactionExecutor.getCurrentTransaction();
+                executor.execute(() -> hmilyTransactionExecutor
+                        .cancel(currentTransaction));
                 throw throwable;
             }
-            //try成功执行confirm confirm 失败的话，那就只能走本地补偿
-            hmilyTransactionExecutor.confirm(hmilyTransactionExecutor.getCurrentTransaction());
+            //execute confirm
+            final TccTransaction currentTransaction = hmilyTransactionExecutor.getCurrentTransaction();
+            executor.execute(() -> hmilyTransactionExecutor.confirm(currentTransaction));
         } finally {
+            TransactionContextLocal.getInstance().remove();
             hmilyTransactionExecutor.remove();
         }
         return returnValue;
+    }
+
+    @Override
+    public void onApplicationEvent(ContextRefreshedEvent event) {
+        if (tccConfig.getStarted()) {
+            executor = new ThreadPoolExecutor(tccConfig.getAsyncThreads(),
+                    tccConfig.getAsyncThreads(), 0, TimeUnit.MILLISECONDS,
+                    new LinkedBlockingQueue<>(),
+                    HmilyThreadFactory.create("hmily-execute", false),
+                    new ThreadPoolExecutor.AbortPolicy());
+        }
+
     }
 }

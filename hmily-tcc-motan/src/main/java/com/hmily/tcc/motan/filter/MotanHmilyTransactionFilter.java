@@ -24,6 +24,7 @@ import com.hmily.tcc.common.bean.entity.Participant;
 import com.hmily.tcc.common.bean.entity.TccInvocation;
 import com.hmily.tcc.common.constant.CommonConstant;
 import com.hmily.tcc.common.enums.TccActionEnum;
+import com.hmily.tcc.common.enums.TccRoleEnum;
 import com.hmily.tcc.common.exception.TccRuntimeException;
 import com.hmily.tcc.common.utils.GsonUtils;
 import com.hmily.tcc.core.concurrent.threadlocal.TransactionContextLocal;
@@ -49,7 +50,7 @@ import java.util.stream.Stream;
  * @author xiaoyu
  */
 @SpiMeta(name = "motanTccTransactionFilter")
-@Activation(key = { MotanConstants.NODE_TYPE_REFERER })
+@Activation(key = {MotanConstants.NODE_TYPE_REFERER})
 public class MotanHmilyTransactionFilter implements Filter {
 
     /**
@@ -77,21 +78,28 @@ public class MotanHmilyTransactionFilter implements Filter {
                     .filter(m -> m.getName().equals(methodName))
                     .findFirst()
                     .map(Method::getParameterTypes).get();
-            method = clazz.getDeclaredMethod(methodName, args);
+            method = clazz.getMethod(methodName, args);
             tcc = method.getAnnotation(Tcc.class);
         } catch (Exception e) {
             e.printStackTrace();
         }
         if (Objects.nonNull(tcc)) {
             try {
+                final HmilyTransactionExecutor hmilyTransactionExecutor = SpringBeanUtils.getInstance().getBean(HmilyTransactionExecutor.class);
                 final TccTransactionContext tccTransactionContext = TransactionContextLocal.getInstance().get();
                 if (Objects.nonNull(tccTransactionContext)) {
+                    if (tccTransactionContext.getRole() == TccRoleEnum.LOCAL.getCode()) {
+                        tccTransactionContext.setRole(TccRoleEnum.INLINE.getCode());
+                    }
                     request.setAttachment(CommonConstant.TCC_TRANSACTION_CONTEXT, GsonUtils.getInstance().toJson(tccTransactionContext));
                 }
                 final Response response = caller.call(request);
                 final Participant participant = buildParticipant(tccTransactionContext, tcc, method, clazz, arguments, args);
-                if (Objects.nonNull(participant)) {
-                    SpringBeanUtils.getInstance().getBean(HmilyTransactionExecutor.class).enlistParticipant(participant);
+                if (tccTransactionContext.getRole() == TccRoleEnum.INLINE.getCode()) {
+                    hmilyTransactionExecutor.registerByNested(tccTransactionContext.getTransId(),
+                            participant);
+                } else {
+                    hmilyTransactionExecutor.enlistParticipant(participant);
                 }
                 return response;
             } catch (Exception e) {

@@ -46,11 +46,13 @@ import org.springframework.stereotype.Component;
 import java.lang.reflect.Method;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.stream.Collectors;
 
 
 /**
  * this is transaction manager.
+ *
  * @author xiaoyu
  */
 @Component
@@ -76,23 +78,24 @@ public class HmilyTransactionExecutor {
 
     /**
      * transaction begin.
+     *
      * @param point cut point.
      * @return TccTransaction
      */
     public TccTransaction begin(final ProceedingJoinPoint point) {
-        LogUtil.debug(LOGGER, () -> "开始执行tcc事务！start");
-        //构建事务对象
+        LogUtil.debug(LOGGER, () -> "......hmily transaction！start....");
+        //build tccTransaction
         final TccTransaction tccTransaction = buildTccTransaction(point, TccRoleEnum.START.getCode(), null);
-        //将事务对象保存在threadLocal中
+        //save tccTransaction in threadLocal
         CURRENT.set(tccTransaction);
-        //发布事务保存事件，异步保存
+        //publishEvent
         hmilyTransactionEventPublisher.publishEvent(tccTransaction, EventTypeEnum.SAVE.getCode());
-        //设置tcc事务上下文，这个类会传递给远端
+        //set TccTransactionContext this context transfer remote
         TccTransactionContext context = new TccTransactionContext();
-        //设置执行动作为try
+        //set action is try
         context.setAction(TccActionEnum.TRYING.getCode());
-        //设置事务id
         context.setTransId(tccTransaction.getTransId());
+        context.setRole(TccRoleEnum.START.getCode());
         TransactionContextLocal.getInstance().set(context);
         return tccTransaction;
     }
@@ -101,17 +104,20 @@ public class HmilyTransactionExecutor {
     /**
      * this is Participant transaction begin.
      *
-     * @param context  transaction context.
+     * @param context transaction context.
      * @param point   cut point
      * @return TccTransaction
      */
     public TccTransaction beginParticipant(final TccTransactionContext context, final ProceedingJoinPoint point) {
-        LogUtil.debug(LOGGER, "参与方开始执行tcc事务！start：{}", context::toString);
+        LogUtil.debug(LOGGER, "...Participant hmily transaction ！start..：{}", context::toString);
         final TccTransaction tccTransaction = buildTccTransaction(point, TccRoleEnum.PROVIDER.getCode(), context.getTransId());
-        //提供者事务存储到guava
+        //cache by guava
         TccTransactionCacheManager.getInstance().cacheTccTransaction(tccTransaction);
-        //发布事务保存事件，异步保存
+        //publishEvent
         hmilyTransactionEventPublisher.publishEvent(tccTransaction, EventTypeEnum.SAVE.getCode());
+        //Nested transaction support
+        context.setRole(TccRoleEnum.LOCAL.getCode());
+        TransactionContextLocal.getInstance().set(context);
         return tccTransaction;
     }
 
@@ -136,7 +142,7 @@ public class HmilyTransactionExecutor {
     /**
      * update Participant in transaction by disruptor.
      *
-     * @param tccTransaction  {@linkplain TccTransaction}
+     * @param tccTransaction {@linkplain TccTransaction}
      */
     public void updateParticipant(final TccTransaction tccTransaction) {
         hmilyTransactionEventPublisher.publishEvent(tccTransaction, EventTypeEnum.UPDATE_PARTICIPANT.getCode());
@@ -157,26 +163,50 @@ public class HmilyTransactionExecutor {
      * @param participant {@linkplain Participant}
      */
     public void enlistParticipant(final Participant participant) {
-        final TccTransaction currentTransaction = this.getCurrentTransaction();
-        currentTransaction.registerParticipant(participant);
-        updateParticipant(currentTransaction);
+        if (Objects.isNull(participant)) {
+            return;
+        }
+        Optional.ofNullable(getCurrentTransaction())
+                .ifPresent(c -> {
+                    c.registerParticipant(participant);
+                    updateParticipant(c);
+                });
     }
 
     /**
-     * 调用confirm方法 这里主要如果是发起者调用 这里调用远端的还是原来的方法
-     * 不过上下文设置了调用confirm
-     * 那么远端的服务则会调用confirm方法.
+     * when nested transaction add participant.
+     *
+     * @param transId     key
+     * @param participant {@linkplain Participant}
+     */
+    public void registerByNested(final String transId, final Participant participant) {
+        if (Objects.isNull(participant)
+                || Objects.isNull(participant.getCancelTccInvocation())
+                || Objects.isNull(participant.getConfirmTccInvocation())) {
+            return;
+        }
+        final TccTransaction tccTransaction = TccTransactionCacheManager.getInstance().getTccTransaction(transId);
+        Optional.ofNullable(tccTransaction)
+                .ifPresent(c -> {
+                    c.registerParticipant(participant);
+                    updateParticipant(c);
+                });
+    }
+
+    /**
+     * Call the confirm method and basically if the initiator calls here call the remote or the original method
+     * However, the context sets the call confirm
+     * The remote service calls the confirm method.
      *
      * @param currentTransaction {@linkplain TccTransaction}
-     * @throws TccRuntimeException 异常
+     * @throws TccRuntimeException ex
      */
     public void confirm(final TccTransaction currentTransaction) throws TccRuntimeException {
-        LogUtil.debug(LOGGER, () -> "开始执行tcc confirm 方法！start");
+        LogUtil.debug(LOGGER, () -> "tcc confirm .......！start");
         if (Objects.isNull(currentTransaction) || CollectionUtils.isEmpty(currentTransaction.getParticipants())) {
             return;
         }
         currentTransaction.setStatus(TccActionEnum.CONFIRMING.getCode());
-        //更新事务日志状态 为confirm
         updateStatus(currentTransaction);
         final List<Participant> participants = currentTransaction.getParticipants();
         List<Participant> failList = Lists.newArrayListWithCapacity(participants.size());
@@ -186,13 +216,16 @@ public class HmilyTransactionExecutor {
                 try {
                     TccTransactionContext context = new TccTransactionContext();
                     context.setAction(TccActionEnum.CONFIRMING.getCode());
+                    context.setRole(TccRoleEnum.START.getCode());
                     context.setTransId(participant.getTransId());
                     TransactionContextLocal.getInstance().set(context);
                     executeParticipantMethod(participant.getConfirmTccInvocation());
                 } catch (Exception e) {
-                    LogUtil.error(LOGGER, "执行confirm方法异常:{}", () -> e);
+                    LogUtil.error(LOGGER, "execute confirm :{}", () -> e);
                     success = false;
                     failList.add(participant);
+                } finally {
+                	TransactionContextLocal.getInstance().remove();
                 }
             }
             executeHandler(success, currentTransaction, failList);
@@ -201,38 +234,41 @@ public class HmilyTransactionExecutor {
 
     /**
      * cancel transaction.
+     *
      * @param currentTransaction {@linkplain TccTransaction}
      */
     public void cancel(final TccTransaction currentTransaction) {
-        LogUtil.debug(LOGGER, () -> "开始执行tcc cancel 方法！start");
+        LogUtil.debug(LOGGER, () -> "tcc cancel ...........start!");
         if (Objects.isNull(currentTransaction) || CollectionUtils.isEmpty(currentTransaction.getParticipants())) {
             return;
         }
-        //如果是cc模式，那么在try阶段是不会进行cancel补偿
+        //if cc pattern，can not execute cancel
         if (currentTransaction.getStatus() == TccActionEnum.TRYING.getCode()
                 && Objects.equals(currentTransaction.getPattern(), TccPatternEnum.CC.getCode())) {
             deleteTransaction(currentTransaction);
             return;
         }
-        //获取回滚节点
         final List<Participant> participants = filterPoint(currentTransaction);
-        currentTransaction.setStatus(TccActionEnum.CANCELING.getCode());
-        //更新事务日志状态 为cancel
-        updateStatus(currentTransaction);
         boolean success = true;
         List<Participant> failList = Lists.newArrayListWithCapacity(participants.size());
         if (CollectionUtils.isNotEmpty(participants)) {
+            currentTransaction.setStatus(TccActionEnum.CANCELING.getCode());
+            //update cancel
+            updateStatus(currentTransaction);
             for (Participant participant : participants) {
                 try {
                     TccTransactionContext context = new TccTransactionContext();
                     context.setAction(TccActionEnum.CANCELING.getCode());
                     context.setTransId(participant.getTransId());
+                    context.setRole(TccRoleEnum.START.getCode());
                     TransactionContextLocal.getInstance().set(context);
                     executeParticipantMethod(participant.getCancelTccInvocation());
-                } catch (Exception e) {
-                    LogUtil.error(LOGGER, "执行cancel方法异常:{}", () -> e);
+                } catch (Throwable e) {
+                    LogUtil.error(LOGGER, "execute cancel ex:{}", () -> e);
                     success = false;
                     failList.add(participant);
+                } finally {
+                	TransactionContextLocal.getInstance().remove();
                 }
             }
             executeHandler(success, currentTransaction, failList);
@@ -240,12 +276,10 @@ public class HmilyTransactionExecutor {
     }
 
     private void executeHandler(final boolean success, final TccTransaction currentTransaction, final List<Participant> failList) {
+        TccTransactionCacheManager.getInstance().removeByKey(currentTransaction.getTransId());
         if (success) {
-            TransactionContextLocal.getInstance().remove();
-            TccTransactionCacheManager.getInstance().removeByKey(currentTransaction.getTransId());
             deleteTransaction(currentTransaction);
         } else {
-            //获取还没执行的，或者执行失败的
             currentTransaction.setParticipants(failList);
             updateParticipant(currentTransaction);
             throw new TccRuntimeException(failList.toString());
@@ -255,7 +289,6 @@ public class HmilyTransactionExecutor {
     private List<Participant> filterPoint(final TccTransaction currentTransaction) {
         final List<Participant> participants = currentTransaction.getParticipants();
         if (CollectionUtils.isNotEmpty(participants)) {
-            //只有在发起者并且是try阶段的时候，才从上一个点开始回滚
             if (currentTransaction.getStatus() == TccActionEnum.TRYING.getCode()
                     && currentTransaction.getRole() == TccRoleEnum.START.getCode()) {
                 return participants.stream()
@@ -278,13 +311,8 @@ public class HmilyTransactionExecutor {
     }
 
     /**
-     * jude transaction is running.
-     * @return true
+     * clean threadLocal help gc.
      */
-    public boolean isBegin() {
-        return CURRENT.get() != null;
-    }
-
     public void remove() {
         CURRENT.remove();
     }
@@ -303,23 +331,22 @@ public class HmilyTransactionExecutor {
         Class<?> clazz = point.getTarget().getClass();
         Object[] args = point.getArgs();
         final Tcc tcc = method.getAnnotation(Tcc.class);
-        //设置模式
         final TccPatternEnum pattern = tcc.pattern();
         tccTransaction.setTargetClass(clazz.getName());
         tccTransaction.setTargetMethod(method.getName());
         tccTransaction.setPattern(pattern.getCode());
         TccInvocation confirmInvocation = null;
-        //获取协调方法
         String confirmMethodName = tcc.confirmMethod();
         String cancelMethodName = tcc.cancelMethod();
         if (StringUtils.isNoneBlank(confirmMethodName)) {
+            tccTransaction.setConfirmMethod(confirmMethodName);
             confirmInvocation = new TccInvocation(clazz, confirmMethodName, method.getParameterTypes(), args);
         }
         TccInvocation cancelInvocation = null;
         if (StringUtils.isNoneBlank(cancelMethodName)) {
+            tccTransaction.setCancelMethod(cancelMethodName);
             cancelInvocation = new TccInvocation(clazz, cancelMethodName, method.getParameterTypes(), args);
         }
-        //封装调用点
         final Participant participant = new Participant(tccTransaction.getTransId(), confirmInvocation, cancelInvocation);
         tccTransaction.registerParticipant(participant);
         return tccTransaction;

@@ -26,12 +26,12 @@ import com.alibaba.dubbo.rpc.Result;
 import com.alibaba.dubbo.rpc.RpcContext;
 import com.alibaba.dubbo.rpc.RpcException;
 import com.hmily.tcc.annotation.Tcc;
-import com.hmily.tcc.annotation.TccPatternEnum;
 import com.hmily.tcc.common.bean.context.TccTransactionContext;
 import com.hmily.tcc.common.bean.entity.Participant;
 import com.hmily.tcc.common.bean.entity.TccInvocation;
 import com.hmily.tcc.common.constant.CommonConstant;
 import com.hmily.tcc.common.enums.TccActionEnum;
+import com.hmily.tcc.common.enums.TccRoleEnum;
 import com.hmily.tcc.common.exception.TccRuntimeException;
 import com.hmily.tcc.common.utils.GsonUtils;
 import com.hmily.tcc.core.concurrent.threadlocal.TransactionContextLocal;
@@ -43,14 +43,16 @@ import java.util.Objects;
 
 /**
  * impl dubbo filter.
+ *
  * @author xiaoyu
  */
 @Activate(group = {Constants.SERVER_KEY, Constants.CONSUMER})
-public class HmilyTransactionFilter implements Filter {
+public class DubboHmilyTransactionFilter implements Filter {
 
     private HmilyTransactionExecutor hmilyTransactionExecutor;
 
     /**
+     * this is init by dubbo spi
      * set hmilyTransactionExecutor.
      *
      * @param hmilyTransactionExecutor {@linkplain HmilyTransactionExecutor }
@@ -66,10 +68,11 @@ public class HmilyTransactionFilter implements Filter {
         Class clazz = invoker.getInterface();
         Class[] args = invocation.getParameterTypes();
         final Object[] arguments = invocation.getArguments();
+        converterParamsClass(args, arguments);
         Method method = null;
         Tcc tcc = null;
         try {
-            method = clazz.getDeclaredMethod(methodName, args);
+            method = clazz.getMethod(methodName, args);
             tcc = method.getAnnotation(Tcc.class);
         } catch (NoSuchMethodException e) {
             e.printStackTrace();
@@ -78,6 +81,9 @@ public class HmilyTransactionFilter implements Filter {
             try {
                 final TccTransactionContext tccTransactionContext = TransactionContextLocal.getInstance().get();
                 if (Objects.nonNull(tccTransactionContext)) {
+                    if (tccTransactionContext.getRole() == TccRoleEnum.LOCAL.getCode()) {
+                        tccTransactionContext.setRole(TccRoleEnum.INLINE.getCode());
+                    }
                     RpcContext.getContext()
                             .setAttachment(CommonConstant.TCC_TRANSACTION_CONTEXT, GsonUtils.getInstance().toJson(tccTransactionContext));
                 }
@@ -85,9 +91,14 @@ public class HmilyTransactionFilter implements Filter {
                 //如果result 没有异常就保存
                 if (!result.hasException()) {
                     final Participant participant = buildParticipant(tccTransactionContext, tcc, method, clazz, arguments, args);
-                    if (Objects.nonNull(participant)) {
+                    if (tccTransactionContext.getRole() == TccRoleEnum.INLINE.getCode()) {
+                        hmilyTransactionExecutor.registerByNested(tccTransactionContext.getTransId(),
+                                participant);
+                    } else {
                         hmilyTransactionExecutor.enlistParticipant(participant);
                     }
+                } else {
+                    throw new TccRuntimeException("rpc invoke exception{}", result.getException());
                 }
                 return result;
             } catch (RpcException e) {
@@ -118,12 +129,18 @@ public class HmilyTransactionFilter implements Filter {
         if (StringUtils.isBlank(cancelMethodName)) {
             cancelMethodName = method.getName();
         }
-        //设置模式
-        final TccPatternEnum pattern = tcc.pattern();
-        hmilyTransactionExecutor.getCurrentTransaction().setPattern(pattern.getCode());
         TccInvocation confirmInvocation = new TccInvocation(clazz, confirmMethodName, args, arguments);
         TccInvocation cancelInvocation = new TccInvocation(clazz, cancelMethodName, args, arguments);
         //封装调用点
         return new Participant(tccTransactionContext.getTransId(), confirmInvocation, cancelInvocation);
+    }
+
+    private void converterParamsClass(final Class[] args, final Object[] arguments) {
+        if (arguments == null || arguments.length < 1) {
+            return;
+        }
+        for (int i = 0; i < arguments.length; i++) {
+            args[i] = arguments[i].getClass();
+        }
     }
 }

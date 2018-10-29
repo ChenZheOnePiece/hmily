@@ -17,19 +17,17 @@
 
 package com.hmily.tcc.admin.spi;
 
-import com.alibaba.druid.pool.DruidDataSource;
 import com.google.common.base.Splitter;
 import com.hmily.tcc.admin.service.CompensationService;
-import com.hmily.tcc.admin.service.compensate.FileCompensationServiceImpl;
-import com.hmily.tcc.admin.service.compensate.JdbcCompensationServiceImpl;
-import com.hmily.tcc.admin.service.compensate.MongoCompensationServiceImpl;
-import com.hmily.tcc.admin.service.compensate.RedisCompensationServiceImpl;
-import com.hmily.tcc.admin.service.compensate.ZookeeperCompensationServiceImpl;
+import com.hmily.tcc.admin.service.compensate.*;
 import com.hmily.tcc.common.jedis.JedisClient;
 import com.hmily.tcc.common.jedis.JedisClientCluster;
+import com.hmily.tcc.common.jedis.JedisClientSentinel;
 import com.hmily.tcc.common.jedis.JedisClientSingle;
+import com.hmily.tcc.common.serializer.ObjectSerializer;
 import com.mongodb.MongoCredential;
 import com.mongodb.ServerAddress;
+import com.zaxxer.hikari.HikariDataSource;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.zookeeper.Watcher;
 import org.apache.zookeeper.ZooKeeper;
@@ -41,27 +39,33 @@ import org.springframework.context.annotation.Profile;
 import org.springframework.core.env.Environment;
 import org.springframework.data.mongodb.core.MongoClientFactoryBean;
 import org.springframework.data.mongodb.core.MongoTemplate;
+import org.springframework.jdbc.core.JdbcTemplate;
 import redis.clients.jedis.HostAndPort;
 import redis.clients.jedis.JedisCluster;
 import redis.clients.jedis.JedisPool;
 import redis.clients.jedis.JedisPoolConfig;
+import redis.clients.jedis.JedisSentinelPool;
 
 import javax.sql.DataSource;
 import java.net.InetSocketAddress;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
 
 /**
+ * CompensationConfiguration.
+ *
  * @author xiaoyu
  */
 @Configuration
 public class CompensationConfiguration {
 
     /**
-     * spring.profiles.active = {}
+     * spring.profiles.active = {}.
      */
     @Configuration
     @Profile("db")
@@ -70,28 +74,22 @@ public class CompensationConfiguration {
         private final Environment env;
 
         @Autowired
-        public JdbcRecoverConfiguration(Environment env) {
+        JdbcRecoverConfiguration(final Environment env) {
             this.env = env;
         }
 
         @Bean
         public DataSource dataSource() {
-            DruidDataSource dataSource = new DruidDataSource();
-            dataSource.setDriverClassName(env.getProperty("compensation.db.driver"));
-            dataSource.setUrl(env.getProperty("compensation.db.url"));
+            HikariDataSource hikariDataSource = new HikariDataSource();
+            hikariDataSource.setDriverClassName(env.getProperty("compensation.db.driver"));
+            hikariDataSource.setJdbcUrl(env.getProperty("compensation.db.url"));
             //用户名
-            dataSource.setUsername(env.getProperty("compensation.db.username"));
+            hikariDataSource.setUsername(env.getProperty("compensation.db.username"));
             //密码
-            dataSource.setPassword(env.getProperty("compensation.db.password"));
-            dataSource.setInitialSize(2);
-            dataSource.setMaxActive(20);
-            dataSource.setMinIdle(0);
-            dataSource.setMaxWait(60000);
-            dataSource.setValidationQuery("SELECT 1");
-            dataSource.setTestOnBorrow(false);
-            dataSource.setTestWhileIdle(true);
-            dataSource.setPoolPreparedStatements(false);
-            return dataSource;
+            hikariDataSource.setPassword(env.getProperty("compensation.db.password"));
+            hikariDataSource.setMinimumIdle(5);
+            hikariDataSource.setMaximumPoolSize(10);
+            return hikariDataSource;
         }
 
         @Bean
@@ -101,10 +99,7 @@ public class CompensationConfiguration {
             jdbcTransactionRecoverService.setDbType(env.getProperty("compensation.db.driver"));
             return jdbcTransactionRecoverService;
         }
-
-
     }
-
 
     @Configuration
     @Profile("redis")
@@ -112,9 +107,12 @@ public class CompensationConfiguration {
 
         private final Environment env;
 
+        private final ObjectSerializer objectSerializer;
+
         @Autowired
-        public RedisRecoverConfiguration(Environment env) {
+        RedisRecoverConfiguration(final Environment env, final ObjectSerializer objectSerializer) {
             this.env = env;
+            this.objectSerializer = objectSerializer;
         }
 
         @Bean
@@ -124,17 +122,30 @@ public class CompensationConfiguration {
             JedisPool jedisPool;
             JedisPoolConfig config = new JedisPoolConfig();
             JedisClient jedisClient;
-            final Boolean cluster = env.getProperty("compensation.redis.cluster", Boolean.class);
+            final Boolean cluster = env.getProperty("compensation.redis.cluster", Boolean.class, Boolean.FALSE);
+            final Boolean sentinel = env.getProperty("compensation.redis.sentinel", Boolean.class, Boolean.FALSE);
+            final String password = env.getProperty("compensation.redis.password");
             if (cluster) {
-                final String clusterUrl = env.getProperty("compensate.redis.clusterUrl");
-                final Set<HostAndPort> hostAndPorts = Splitter.on(clusterUrl)
-                        .splitToList(";").stream()
+                final String clusterUrl = env.getProperty("compensation.redis.clusterUrl");
+                assert clusterUrl != null;
+                final Set<HostAndPort> hostAndPorts = Splitter.on(";")
+                        .splitToList(clusterUrl).stream()
                         .map(HostAndPort::parseString).collect(Collectors.toSet());
                 JedisCluster jedisCluster = new JedisCluster(hostAndPorts, config);
                 jedisClient = new JedisClientCluster(jedisCluster);
+            } else if (sentinel) {
+                final String sentinelUrl = env.getProperty("compensation.redis.sentinelUrl");
+                assert sentinelUrl != null;
+                final Set<String> hostAndPorts =
+                        new HashSet<>(Splitter.on(";")
+                                .splitToList(sentinelUrl));
+                final String master = env.getProperty("compensation.redis.master");
+                JedisSentinelPool pool =
+                        new JedisSentinelPool(master, hostAndPorts,
+                                config, password);
+                jedisClient = new JedisClientSentinel(pool);
             } else {
-                final String password = env.getProperty("compensation.redis.password");
-                final String port = env.getProperty("compensation.redis.port");
+                final String port = env.getProperty("compensation.redis.port", "6379");
                 final String hostName = env.getProperty("compensation.redis.hostName");
                 if (StringUtils.isNoneBlank(password)) {
                     jedisPool = new JedisPool(config, hostName,
@@ -144,23 +155,26 @@ public class CompensationConfiguration {
                             Integer.parseInt(port), 30);
                 }
                 jedisClient = new JedisClientSingle(jedisPool);
-
             }
-
-            return new RedisCompensationServiceImpl(jedisClient);
+            return new RedisCompensationServiceImpl(jedisClient, objectSerializer);
         }
-
-
     }
 
     @Configuration
     @Profile("file")
     static class FileRecoverConfiguration {
 
+        private final ObjectSerializer objectSerializer;
+
+        @Autowired
+        FileRecoverConfiguration(final ObjectSerializer objectSerializer) {
+            this.objectSerializer = objectSerializer;
+        }
+
         @Bean
         @Qualifier("fileTransactionRecoverService")
         public CompensationService fileTransactionRecoverService() {
-            return new FileCompensationServiceImpl();
+            return new FileCompensationServiceImpl(objectSerializer);
         }
 
     }
@@ -169,23 +183,25 @@ public class CompensationConfiguration {
     @Profile("zookeeper")
     static class ZookeeperRecoverConfiguration {
 
-        private final Environment env;
-
-        @Autowired
-        public ZookeeperRecoverConfiguration(Environment env) {
-            this.env = env;
-        }
-
         private static final Lock LOCK = new ReentrantLock();
 
+        private final Environment env;
+
+        private final ObjectSerializer objectSerializer;
+
+        @Autowired
+        ZookeeperRecoverConfiguration(final Environment env, final ObjectSerializer objectSerializer) {
+            this.env = env;
+            this.objectSerializer = objectSerializer;
+        }
 
         @Bean
         @Qualifier("zookeeperTransactionRecoverService")
         public CompensationService zookeeperTransactionRecoverService() {
             ZooKeeper zooKeeper = null;
             try {
-                final String host = env.getProperty("compensation.zookeeper.host");
-                final String sessionTimeOut = env.getProperty("compensation.zookeeper.sessionTimeOut");
+                final String host = env.getProperty("compensation.zookeeper.host", "2181");
+                final String sessionTimeOut = env.getProperty("compensation.zookeeper.sessionTimeOut", "3000");
                 zooKeeper = new ZooKeeper(host, Integer.parseInt(sessionTimeOut), watchedEvent -> {
                     if (watchedEvent.getState() == Watcher.Event.KeeperState.SyncConnected) {
                         // 放开闸门, wait在connect方法上的线程将被唤醒
@@ -196,10 +212,8 @@ public class CompensationConfiguration {
             } catch (Exception e) {
                 e.printStackTrace();
             }
-
-            return new ZookeeperCompensationServiceImpl(zooKeeper);
+            return new ZookeeperCompensationServiceImpl(zooKeeper, objectSerializer);
         }
-
     }
 
     @Configuration
@@ -209,23 +223,24 @@ public class CompensationConfiguration {
         private final Environment env;
 
         @Autowired
-        public MongoRecoverConfiguration(Environment env) {
+        MongoRecoverConfiguration(final Environment env) {
             this.env = env;
         }
 
         @Bean
         @Qualifier("mongoTransactionRecoverService")
         public CompensationService mongoTransactionRecoverService() {
-
             MongoClientFactoryBean clientFactoryBean = new MongoClientFactoryBean();
+            final String userName = env.getProperty("compensation.mongo.userName", "xiaoyu");
+            final String dbName = env.getProperty("compensation.mongo.dbName", "col");
+            final String password = env.getProperty("compensation.mongo.password", "123456");
+            final String url = env.getProperty("compensation.mongo.url", "127.0.0.1");
             MongoCredential credential = MongoCredential.createScramSha1Credential(
-                    env.getProperty("compensation.mongo.userName"),
-                    env.getProperty("compensation.mongo.dbName"),
-                    env.getProperty("compensation.mongo.password").toCharArray());
-            clientFactoryBean.setCredentials(new MongoCredential[]{
-                    credential
-            });
-            List<String> urls = Splitter.on(",").trimResults().splitToList(env.getProperty("compensation.mongo.url"));
+                    userName,
+                    dbName,
+                    password.toCharArray());
+            clientFactoryBean.setCredentials(new MongoCredential[]{credential});
+            List<String> urls = Splitter.on(",").trimResults().splitToList(url);
             ServerAddress[] sds = new ServerAddress[urls.size()];
             for (int i = 0; i < sds.length; i++) {
                 List<String> adds = Splitter.on(":").trimResults().splitToList(urls.get(i));
@@ -233,15 +248,14 @@ public class CompensationConfiguration {
                 sds[i] = new ServerAddress(address);
             }
             clientFactoryBean.setReplicaSetSeeds(sds);
-
             MongoTemplate mongoTemplate = null;
             try {
                 clientFactoryBean.afterPropertiesSet();
-                mongoTemplate = new MongoTemplate(clientFactoryBean.getObject(), env.getProperty("compensation.mongo.dbName"));
+                mongoTemplate = new MongoTemplate(Objects.requireNonNull(clientFactoryBean.getObject()),
+                        dbName);
             } catch (Exception e) {
                 e.printStackTrace();
             }
-
             return new MongoCompensationServiceImpl(mongoTemplate);
         }
 

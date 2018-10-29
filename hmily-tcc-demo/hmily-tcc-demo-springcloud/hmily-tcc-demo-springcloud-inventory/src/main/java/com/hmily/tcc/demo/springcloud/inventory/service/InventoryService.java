@@ -1,19 +1,18 @@
 /*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
- * Copyright 2017-2018 549477611@qq.com(xiaoyu)
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * This copyrighted material is made available to anyone wishing to use, modify,
- * copy, or redistribute it subject to the terms and conditions of the GNU
- * Lesser General Public License, as published by the Free Software Foundation.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
- * or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU Lesser General Public License
- * for more details.
- *
- * You should have received a copy of the GNU Lesser General Public License
- * along with this distribution; if not, see <http://www.gnu.org/licenses/>.
- *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 package com.hmily.tcc.demo.springcloud.inventory.service;
@@ -26,11 +25,11 @@ import com.hmily.tcc.demo.springcloud.inventory.entity.InventoryDO;
 /**
  * @author xiaoyu
  */
+@SuppressWarnings("all")
 public interface InventoryService {
 
-
     /**
-     * 扣减库存操作
+     * 扣减库存操作.
      * 这一个tcc接口
      *
      * @param inventoryDTO 库存DTO对象
@@ -39,17 +38,15 @@ public interface InventoryService {
     @Tcc
     Boolean decrease(InventoryDTO inventoryDTO);
 
-
     /**
-     * 获取商品库存信息
+     * 获取商品库存信息.
      * @param productId 商品id
      * @return InventoryDO
      */
     InventoryDO findByProductId(String productId);
 
-
     /**
-     * mock 库存扣减try阶段异常
+     * mock 库存扣减try阶段异常.
      *
      * @param inventoryDTO dto
      * @return true
@@ -57,15 +54,13 @@ public interface InventoryService {
     @Tcc
     Boolean mockWithTryException(InventoryDTO inventoryDTO);
 
-
     /**
-     * mock 库存扣减try阶段超时
+     * mock 库存扣减try阶段超时.
      *
      * @param inventoryDTO dto
      * @return true
      */
     @Tcc
     Boolean mockWithTryTimeout(InventoryDTO inventoryDTO);
-
 
 }

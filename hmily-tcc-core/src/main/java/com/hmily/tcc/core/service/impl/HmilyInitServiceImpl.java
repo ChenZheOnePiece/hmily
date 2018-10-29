@@ -27,6 +27,7 @@ import com.hmily.tcc.common.utils.ServiceBootstrap;
 import com.hmily.tcc.core.coordinator.CoordinatorService;
 import com.hmily.tcc.core.disruptor.publisher.HmilyTransactionEventPublisher;
 import com.hmily.tcc.core.helper.SpringBeanUtils;
+import com.hmily.tcc.core.logo.HmilyLogo;
 import com.hmily.tcc.core.service.HmilyInitService;
 import com.hmily.tcc.core.spi.CoordinatorRepository;
 import com.hmily.tcc.core.spi.repository.JdbcCoordinatorRepository;
@@ -41,6 +42,7 @@ import java.util.stream.StreamSupport;
 
 /**
  * hmily tcc init service.
+ *
  * @author xiaoyu
  */
 @Service("tccInitService")
@@ -68,39 +70,37 @@ public class HmilyInitServiceImpl implements HmilyInitService {
      */
     @Override
     public void initialization(final TccConfig tccConfig) {
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> LOGGER.error("hmily tcc init error !")));
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> LOGGER.info("hmily shutdown now")));
         try {
             loadSpiSupport(tccConfig);
-            hmilyTransactionEventPublisher.start(tccConfig.getBufferSize());
+            hmilyTransactionEventPublisher.start(tccConfig.getBufferSize(), tccConfig.getConsumerThreads());
             coordinatorService.start(tccConfig);
         } catch (Exception ex) {
             LogUtil.error(LOGGER, " hmily init exception:{}", ex::getMessage);
-            //非正常关闭
             System.exit(1);
         }
-        LogUtil.info(LOGGER, () -> "hmily init success!");
+        new HmilyLogo().logo();
     }
 
     /**
      * load spi.
      *
-     * @param tccConfig  {@linkplain TccConfig}
+     * @param tccConfig {@linkplain TccConfig}
      */
     private void loadSpiSupport(final TccConfig tccConfig) {
-        //spi  serialize
+        //spi serialize
         final SerializeEnum serializeEnum = SerializeEnum.acquire(tccConfig.getSerializer());
         final ServiceLoader<ObjectSerializer> objectSerializers = ServiceBootstrap.loadAll(ObjectSerializer.class);
         final ObjectSerializer serializer = StreamSupport.stream(objectSerializers.spliterator(), false)
                 .filter(objectSerializer -> Objects.equals(objectSerializer.getScheme(), serializeEnum.getSerialize()))
                 .findFirst().orElse(new KryoSerializer());
-        //spi  repository
+        //spi repository
         final RepositorySupportEnum repositorySupportEnum = RepositorySupportEnum.acquire(tccConfig.getRepositorySupport());
         final ServiceLoader<CoordinatorRepository> recoverRepositories = ServiceBootstrap.loadAll(CoordinatorRepository.class);
         final CoordinatorRepository repository = StreamSupport.stream(recoverRepositories.spliterator(), false)
                 .filter(recoverRepository -> Objects.equals(recoverRepository.getScheme(), repositorySupportEnum.getSupport()))
                 .findFirst().orElse(new JdbcCoordinatorRepository());
         repository.setSerializer(serializer);
-        //将CoordinatorRepository实现注入到spring容器
         SpringBeanUtils.getInstance().registerBean(CoordinatorRepository.class.getName(), repository);
     }
 }
